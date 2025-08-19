@@ -1,0 +1,205 @@
+# -*- coding: utf-8 -*-
+"""
+Two-borehole field for a 2.5-ton AC (cooling) in Bangladesh
+Single U-tube per borehole (series), pygfunction 2.3.x
+
+- Ground heat rejection ~ 11.3 kW (8.8 kW cooling + ~2.5 kW compressor)
+- g-function (MIFT)
+- Claesson & Javed load aggregation
+- Network/pipe model for inlet/outlet fluid temperatures
+"""
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pygfunction as gt
+
+
+def main():
+    # -------------------------
+    # Site / ground (Bangladesh-like)
+    # -------------------------
+    T_g   = 26.0       # undisturbed ground temperature [°C] (use 27–28 for conservative)
+    k_s   = 2.5        # ground thermal conductivity [W/m.K]
+    alpha = 1.0e-6     # ground thermal diffusivity [m2/s]
+
+    # -------------------------
+    # Borehole geometry
+    # -------------------------
+    D   = 4.0          # burial depth [m]
+    H   = 100.0        # active length [m] (try 180.0 for cooler loop temps)
+    r_b = 0.075        # borehole radius [m]
+
+    # EXACTLY TWO BOREHOLES (2 x 1)
+    # EXACTLY TWO BOREHOLES (2 x 1)
+    N_1 = 2            # columns
+    N_2 = 2            # rows
+    Bx  = 6          # spacing x [m]
+    By  = 6          # spacing y [m] (unused when N_2 = 1)
+
+    # -------------------------
+    # Pipe / grout / fluid
+    # -------------------------
+    # Single U-tube
+    r_out   = 0.0211   # outer radius [m]
+    r_in    = 0.0147   # inner radius [m]
+    D_s     = 0.052    # shank spacing [m] (distance between legs)
+    epsilon = 1.0e-6   # pipe roughness [m]
+    # Positions for single U (two legs, symmetric about center)
+    pos = [(-D_s/2.0, 0.0), ( D_s/2.0, 0.0)]
+
+    k_g   = 2.6        # grout conductivity [W/m.K] (slightly higher for better transfer)
+    k_p   = 0.4        # pipe conductivity [W/m.K]
+
+    # Fluid: consider water for cooling-only (better cp/k, lower mu). Use MPG if freeze risk.
+    # fluid = gt.media.Fluid('Water', 30.0)     # (alt) water at ~30°C
+    fluid = gt.media.Fluid('MPG', 20.0)         # 20% propylene glycol @ 20°C
+    cp_f  = fluid.cp
+    rho_f = fluid.rho
+    mu_f  = fluid.mu
+    k_f   = fluid.k
+
+    # Mass flow
+    m_flow_borehole = 0.30                       # per borehole [kg/s] (slightly higher than 0.25)
+    nBoreholes      = N_1 * N_2                  # = 2
+    m_flow_network  = m_flow_borehole * nBoreholes
+
+    # -------------------------
+    # Time & g-function options
+    # -------------------------
+    options = {'nSegments': 8, 'disp': True}
+    dt   = 3600.0                 # 1 hour [s]
+    tmax = 5*30*24 * 3600.0        # 1 year [s]
+    Nt   = int(np.ceil(tmax/dt))
+    time = dt * np.arange(1, Nt+1)
+
+    # Load aggregation (Claesson & Javed)
+    LoadAgg = gt.load_aggregation.ClaessonJaved(dt, tmax)
+
+    # -------------------------
+    # Build bore field & network
+    # -------------------------
+    borefield = gt.boreholes.rectangle_field(N_1, N_2, Bx, By, H, D, r_b)
+
+    # Pipe wall conduction resistance (circular pipe)
+    R_p = gt.pipes.conduction_thermal_resistance_circular_pipe(r_in, r_out, k_p)
+
+    # Fluid-to-inner wall convection (SINGLE U ⇒ whole per-borehole flow through the pair)
+    m_flow_pipe = m_flow_borehole
+    h_f = gt.pipes.convective_heat_transfer_coefficient_circular_pipe(
+        m_flow_pipe, r_in, mu_f, rho_f, k_f, cp_f, epsilon
+    )
+    R_f = 1.0 / (h_f * 2.0 * np.pi * r_in)
+
+    # Create ONE U-tube per borehole using MultipleUTube with series config
+    UTubes = []
+    for bh in borefield:
+        ut = gt.pipes.MultipleUTube(
+            pos, r_in, r_out, bh, k_s, k_g, R_f + R_p,
+            nPipes=1, config='series'   # single U (series path down & up)
+        )
+        UTubes.append(ut)
+
+    # Build the hydraulic/thermal network
+    network = gt.networks.Network(borefield, UTubes)
+
+    # -------------------------
+    # g-function & aggregator init
+    # -------------------------
+    time_req = LoadAgg.get_times_for_simulation()
+    gFunc = gt.gfunction.gFunction(
+        network, alpha, time=time_req, m_flow_network=m_flow_network,
+        cp_f=cp_f, boundary_condition='MIFT', options=options
+    )
+    # Convert to kernel used by the aggregator
+    LoadAgg.initialize(gFunc.gFunc / (2.0 * np.pi * k_s))
+
+    # -------------------------
+    # Cooling-only load: 2.5-ton AC → ~11.3 kW ground heat rejection
+    # -------------------------
+    Q_reject_W = 1000.0  # W (positive = heat injected into ground)
+    Q_tot = np.full(Nt, Q_reject_W)
+
+    # -------------------------
+    # Time marching
+    # -------------------------
+    T_b     = np.zeros(Nt)  # borehole wall temperature [°C]
+    T_f_in  = np.zeros(Nt)  # network inlet fluid temperature [°C]
+    T_f_out = np.zeros(Nt)  # network outlet fluid temperature [°C]
+
+    for i, (t, Q) in enumerate(zip(time, Q_tot)):
+        LoadAgg.next_time_step(t)
+
+        # Per-meter load for each borehole
+        Q_b = Q / nBoreholes / H     # [W/m] per borehole
+        LoadAgg.set_current_load(Q_b)
+
+        # Wall temperature rise from superposition (cooling injects heat)
+        dT_b = LoadAgg.temporal_superposition()
+        T_b[i] = T_g + dT_b   # injection → wall > Tg
+
+        # Network inlet/outlet temperatures
+        T_f_in[i] = network.get_network_inlet_temperature(
+            Q_tot[i], T_b[i], m_flow_network, cp_f, nSegments=1
+        )
+        T_f_out[i] = network.get_network_outlet_temperature(
+            T_f_in[i], T_b[i], m_flow_network, cp_f, nSegments=1
+        )
+
+    # -------------------------
+    # Plots: loads & temps
+    # -------------------------
+    hours = np.arange(1, Nt+1) * dt / 3600.0
+
+    fig = gt.utilities._initialize_figure()
+    ax1 = fig.add_subplot(211)
+    ax1.set_xlabel(r'Time [hours]')
+    ax1.set_ylabel(r'Ground heat rejection [W]')
+    gt.utilities._format_axes(ax1)
+    ax1.plot(hours, Q_tot)
+
+    ax2 = fig.add_subplot(212)
+    ax2.set_xlabel(r'Time [hours]')
+    ax2.set_ylabel(r'Temperature [°C]')
+    gt.utilities._format_axes(ax2)
+    ax2.plot(hours, T_b, label='Borehole wall')
+    ax2.plot(hours, T_f_out, '-.', label='Outlet, single U-tube (series)')
+    ax2.legend()
+    plt.tight_layout()
+
+    # -------------------------
+    # Depth profile at ~1 year
+    # -------------------------
+    nz = 20
+    it = min(8724, Nt-1)
+    z = np.linspace(0.0, H, num=nz)   # depth [m]
+    T_f = UTubes[0].get_temperature(z, T_f_in[it], T_b[it],
+                                    m_flow_borehole, cp_f)
+
+    fig = gt.utilities._initialize_figure()
+    ax3 = fig.add_subplot(111)
+    ax3.set_xlabel(r'Temperature [°C]')
+    ax3.set_ylabel(r'Depth from borehole head [m]')
+    gt.utilities._format_axes(ax3)
+    p1 = ax3.plot(T_f, z, 'b-', label='Fluid')
+    p2 = ax3.plot([T_b[it], T_b[it]], [0.0, H], 'k--', label='Borehole wall')
+    ax3.legend(handles=[p1[0]] + p2)
+    ax3.set_ylim(ax3.get_ylim()[::-1])  # invert axis (downwards)
+    plt.tight_layout()
+
+    # -------------------------
+    # Optional: CSV export (uncomment to save)
+    # -------------------------
+    # import pandas as pd
+    # df = pd.DataFrame({
+    #     'hour': hours,
+    #     'Q_tot_W': Q_tot,
+    #     'T_b_degC': T_b,
+    #     'T_f_in_degC': T_f_in,
+    #     'T_f_out_degC': T_f_out
+    # })
+    # df.to_csv('bd_2p5ton_two_bores_singleU_timeseries.csv', index=False)
+    # print('Saved: bd_2p5ton_two_bores_singleU_timeseries.csv')
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,256 @@
+# -*- coding: utf-8 -*-
+"""
+pygfunction 2.3.0 (pdf: pygfunction-readthedocs-io-en-stable)
+4.14 Simulation of fluid temperatures in a field of multiple boreholes
+This example demonstrates the use of the networks module to predict the fluid temperature variations in a bore field
+with known heat extraction rates.
+The g-function of a bore field is first calculated using the equal inlet fluid temperature boundary condition1. Then, the
+borehole wall temperature variations are calculated using the load aggregation scheme of Claesson and Javed2. The
+time-variation of heat extraction rates is given by the synthetic load profile of Bernier et al.3. Predicted inlet and outlet
+fluid temperatures of double U-tube boreholes are calculated using the model of Cimmino4.
+The script is located in: pygfunction/examples/fluid_temperature_multiple_boreholes.py
+Simulation of fluid temperatures in a field of multiple boreholes.
+
+- Compute the g-function of a bore field (equal mixed inlet fluid temperature).
+- Propagate time-varying loads via Claesson & Javed (2012) load aggregation.
+- Predict inlet/outlet fluid temperatures of double U-tube boreholes using
+  the network/pipe model of Cimmino.
+"""
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pygfunction as gt
+
+
+def main():
+    # ---------------------------------------------------------------
+    # Simulation parameters
+    # ---------------------------------------------------------------
+
+    # Borehole dimensions
+    D   = 4.0     # burial depth [m]
+    H   = 150.0   # length [m]
+    r_b = 0.075   # borehole radius [m]
+
+    # Bore field geometry (rectangular array)
+    N_1 = 6       # columns (x-direction)
+    N_2 = 4       # rows (y-direction)
+    B   = 7.5     # spacing in both directions [m]
+
+    # Pipe dimensions (double U-tube)
+    r_out  = 0.0211   # outer radius [m]
+    r_in   = 0.0147   # inner radius [m]
+    D_s    = 0.052    # shank spacing [m]
+    epsilon = 1.0e-6  # roughness [m]
+# -*- coding: utf-8 -*-
+"""
+Simulation of fluid temperatures in a field of multiple boreholes.
+
+- Compute the g-function of a bore field (equal mixed inlet fluid temperature).
+- Propagate time-varying loads via Claesson & Javed (2012) load aggregation.
+- Predict inlet/outlet fluid temperatures of double U-tube boreholes using
+  the network/pipe model of Cimmino.
+"""
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pygfunction as gt
+
+
+def main():
+    # ---------------------------------------------------------------
+    # Simulation parameters
+    # ---------------------------------------------------------------
+
+    # Borehole dimensions
+    D   = 4.0     # burial depth [m]
+    H   = 150.0   # length [m]
+    r_b = 0.075   # borehole radius [m]
+
+    # Bore field geometry (rectangular array)
+    N_1 = 6       # columns (x-direction)
+    N_2 = 4       # rows (y-direction)
+    B   = 7.5     # spacing in both directions [m]
+
+    # Pipe dimensions (double U-tube)
+    r_out  = 0.0211   # outer radius [m]
+    r_in   = 0.0147   # inner radius [m]
+    D_s    = 0.052    # shank spacing [m]
+    epsilon = 1.0e-6  # roughness [m]
+    # Pipe positions (four legs of a double U)
+    # [(x_in1,y_in1), (x_in2,y_in2), (x_out1,y_out1), (x_out2,y_out2)]
+    pos = [(-D_s, 0.0), (0.0, -D_s), (D_s, 0.0), (0.0, D_s)]
+
+    # Ground properties
+    alpha = 1.0e-6   # thermal diffusivity [m2/s]
+    k_s   = 2.0      # conductivity [W/m.K]
+    T_g   = 10.0     # undisturbed ground temperature [°C]
+
+    # Grout & pipe conductivities
+    k_g = 1.0        # grout [W/m.K]
+    k_p = 0.4        # pipe [W/m.K]
+
+    # Fluid properties and mass flow
+    m_flow_borehole = 0.25                     # per borehole [kg/s]
+    m_flow_network  = m_flow_borehole * N_1 * N_2
+    fluid = gt.media.Fluid('MPG', 20.0)        # 20% propylene-glycol @ 20°C
+    cp_f = fluid.cp
+    rho_f = fluid.rho
+    mu_f  = fluid.mu
+    k_f   = fluid.k
+
+    # g-function calculation options
+    options = {'nSegments': 8, 'disp': True}
+
+    # Time discretisation
+    dt    = 3600.0                 # 1 hour [s]
+    tmax  = 1.0 * 8760.0 * 3600.0  # 1 year [s]
+    Nt    = int(np.ceil(tmax/dt))
+    time  = dt * np.arange(1, Nt+1)
+
+    # ---------------------------------------------------------------
+    # Load aggregation scheme (Claesson & Javed)
+    # ---------------------------------------------------------------
+    LoadAgg = gt.load_aggregation.ClaessonJaved(dt, tmax)
+
+    # ---------------------------------------------------------------
+    # Build borefield and pipe network
+    # ---------------------------------------------------------------
+
+    # Rectangular field
+    borefield = gt.boreholes.rectangle_field(
+        N_1, N_2, B, B, H, D, r_b)
+    nBoreholes = len(borefield)
+
+    # Pipe wall conduction resistance (circular pipe)
+    R_p = gt.pipes.conduction_thermal_resistance_circular_pipe(
+        r_in, r_out, k_p)
+
+    # Fluid-to-inner wall convection (each U-leg in parallel)
+    m_flow_pipe = m_flow_borehole / 2.0
+    h_f = gt.pipes.convective_heat_transfer_coefficient_circular_pipe(
+        m_flow_pipe, r_in, mu_f, rho_f, k_f, cp_f, epsilon)
+    R_f = 1.0 / (h_f * 2.0 * np.pi * r_in)
+
+    # Instantiate a double U-tube in every borehole (legs in parallel)
+    UTubes = []
+    for bh in borefield:
+        ut = gt.pipes.MultipleUTube(
+            pos, r_in, r_out, bh, k_s, k_g, R_f + R_p,
+            nPipes=2, config='parallel')
+        UTubes.append(ut)
+
+    # Network object of all U-tubes
+    network = gt.networks.Network(borefield, UTubes)
+
+    # ---------------------------------------------------------------
+    # g-function and load aggregation initialisation
+    # ---------------------------------------------------------------
+
+    time_req = LoadAgg.get_times_for_simulation()
+    gFunc = gt.gfunction.gFunction(
+        network, alpha, time=time_req, m_flow_network=m_flow_network,
+        cp_f=cp_f, boundary_condition='MIFT', options=options)
+
+    LoadAgg.initialize(gFunc.gFunc / (2.0 * np.pi * k_s))
+
+    # ---------------------------------------------------------------
+    # Time marching: loads -> wall temp -> inlet/outlet temps
+    # ---------------------------------------------------------------
+
+    Q_tot = nBoreholes * synthetic_load(time / 3600.0)  # W total
+
+    T_b     = np.zeros(Nt)   # borehole wall temperature
+    T_f_in  = np.zeros(Nt)   # network inlet fluid temperature
+    T_f_out = np.zeros(Nt)   # network outlet fluid temperature
+
+    for i, (t, Q) in enumerate(zip(time, Q_tot)):
+        LoadAgg.next_time_step(t)        # advance time
+        Q_b = Q / nBoreholes / H         # W per meter of borehole
+        LoadAgg.set_current_load(Q_b)
+
+        # wall temperature (ΔT relative to ground)
+        deltaT_b = LoadAgg.temporal_superposition()
+        T_b[i] = T_g - deltaT_b
+
+        # network inlet / outlet temperatures (all BHs equal)
+        T_f_in[i] = network.get_network_inlet_temperature(
+            Q_tot[i], T_b[i], m_flow_network, cp_f, nSegments=1)
+
+        T_f_out[i] = network.get_network_outlet_temperature(
+            T_f_in[i], T_b[i], m_flow_network, cp_f, nSegments=1)
+
+    # ---------------------------------------------------------------
+    # Plots: hourly loads and temperatures
+    # ---------------------------------------------------------------
+
+    hours = np.arange(1, Nt+1) * dt / 3600.0
+
+    fig = gt.utilities._initialize_figure()
+    ax1 = fig.add_subplot(211)
+    ax1.set_xlabel(r'Time [hours]')
+    ax1.set_ylabel(r'Total heat extraction rate [W]')
+    gt.utilities._format_axes(ax1)
+    ax1.plot(hours, Q_tot)
+
+    ax2 = fig.add_subplot(212)
+    ax2.set_xlabel(r'Time [hours]')
+    ax2.set_ylabel(r'Temperature [degC]')
+    gt.utilities._format_axes(ax2)
+    ax2.plot(hours, T_b, label='Borehole wall')
+    ax2.plot(hours, T_f_out, '-.', label='Outlet, double U-tube (parallel)')
+    ax2.legend()
+    plt.tight_layout()
+
+    # ---------------------------------------------------------------
+    # Vertical temperature profile at one time (example at ~1 year)
+    # ---------------------------------------------------------------
+    nz = 20
+    it = 8724                        # pick a time index
+    z = np.linspace(0.0, H, num=nz)  # depth from head [m]
+
+    T_f = UTubes[0].get_temperature(
+        z, T_f_in[it], T_b[it], m_flow_borehole, cp_f)
+
+    fig = gt.utilities._initialize_figure()
+    ax3 = fig.add_subplot(111)
+    ax3.set_xlabel(r'Temperature [degC]')
+    ax3.set_ylabel(r'Depth from borehole head [m]')
+    gt.utilities._format_axes(ax3)
+    pltFlu = ax3.plot(T_f, z, 'b-', label='Fluid')
+    pltWal = ax3.plot(np.array([T_b[it], T_b[it]]), np.array([0.0, H]),
+                      'k--', label='Borehole wall')
+    ax3.legend(handles=[pltFlu[0]] + pltWal)
+    ax3.set_ylim(ax3.get_ylim()[::-1])  # invert depth axis (downwards)
+    plt.tight_layout()
+
+
+def synthetic_load(x_hours):
+    """
+    Synthetic load profile of Bernier et al. (2004).
+    Returns heat extraction y [W] at time x [h].
+    """
+    A = 2000.0
+    B = 2190.0
+    C = 80.0
+    D = 2.0
+    E = 0.01
+    F = 0.0
+    G = 0.95
+
+    func = (168.0 - C) / 168.0
+    for i in [1, 2, 3]:
+        func += (1.0 / (i * np.pi)) * (np.cos(C * np.pi * i / 84.0) - 1.0) \
+              * (np.sin(np.pi * i / 84.0 * (x_hours - B)))
+    func = func * A * np.sin(np.pi / 12.0 * (x_hours - B)) \
+         * np.sin(np.pi / 4380.0 * (x_hours - B))
+
+    y = func + (-1.0) * np.pi * np.floor(D / 8760.0 * (x_hours - B)) * np.abs(func) \
+      + E * (-1.0) * np.pi * np.floor(D / 8760.0 * (x_hours - B)) \
+      / np.sign(np.cos(D * np.pi / 4380.0 * (x_hours - F)) + G)
+
+    return -y
+
+
+if __name__ == '__main__':
+    main()

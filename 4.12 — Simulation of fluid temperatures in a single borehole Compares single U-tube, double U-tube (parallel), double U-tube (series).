@@ -1,0 +1,242 @@
+# -*- coding: utf-8 -*-
+"""
+pygfunction >= 2.3.x
+4.12 — Simulation of fluid temperatures in a single borehole
+Compares single U-tube, double U-tube (parallel), double U-tube (series).
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import pygfunction as gt
+
+
+def main():
+    # ---------------------------------------------------------------
+    # Simulation parameters
+    # ---------------------------------------------------------------
+
+    # Borehole dimensions
+    D   = 4.0       # burial depth [m]
+    H   = 150.0     # length [m]
+    r_b = 0.075     # borehole radius [m]
+
+    # Pipe dimensions
+    r_out   = 0.0211    # outer radius [m]
+    r_in    = 0.0147    # inner radius [m]
+    D_s     = 0.052     # shank spacing [m]
+    epsilon = 1.0e-6    # roughness [m]
+
+    # Pipe positions (x,y)
+    # Single U-tube: [(x_in, y_in), (x_out, y_out)]
+    pos_single = [(-D_s, 0.0), ( D_s, 0.0)]
+
+    # Double U-tube (legs 1..4: in1, in2, out1, out2)
+    # Note about series: inlet->(in1)->(out1)->(in2)->(out2)->outlet
+    pos_double = [(-D_s, 0.0), (0.0, -D_s), ( D_s, 0.0), (0.0,  D_s)]
+
+    # Ground
+    alpha = 1.0e-6    # thermal diffusivity [m2/s]
+    k_s   = 2.0       # thermal conductivity [W/m.K]
+    T_g   = 10.0      # undisturbed ground temperature [°C]
+
+    # Grout / pipe conductivity
+    k_g = 1.0         # grout [W/m.K]
+    k_p = 0.4         # pipe  [W/m.K]
+
+    # Fluid (20% MPG at 20°C)
+    m_flow = 0.25                         # total mass flow rate [kg/s]
+    fluid  = gt.media.Fluid('MPG', 20.0)
+    cp_f   = fluid.cp
+    rho_f  = fluid.rho
+    mu_f   = fluid.mu
+    k_f    = fluid.k
+
+    # g-Function options
+    options = {'nSegments': 8, 'disp': True}
+
+    # Time grid (1 year, hourly)
+    dt    = 3600.0
+    tmax  = 8760.0 * 3600.0
+    Nt    = int(np.ceil(tmax / dt))
+    time  = dt * np.arange(1, Nt + 1)
+
+    # ---------------------------------------------------------------
+    # Loads (Bernier synthetic profile)
+    # ---------------------------------------------------------------
+    Q = synthetic_load(time / 3600.0)  # W (heat extraction rate)
+
+    # ---------------------------------------------------------------
+    # Load aggregation
+    # ---------------------------------------------------------------
+    LoadAgg = gt.load_aggregation.ClaessonJaved(dt, tmax)
+
+    # ---------------------------------------------------------------
+    # g-function (single borehole, UBWT boundary)
+    # ---------------------------------------------------------------
+    borehole = gt.boreholes.Borehole(H, D, r_b, x=0.0, y=0.0)
+    time_req = LoadAgg.get_times_for_simulation()
+    gFunc = gt.gfunction.gFunction(
+        borehole, alpha, time=time_req, boundary_condition='UBWT',
+        options=options
+    )
+    LoadAgg.initialize(gFunc.gFunc / (2.0 * np.pi * k_s))
+
+    # ---------------------------------------------------------------
+    # Pipe models
+    # ---------------------------------------------------------------
+    # Pipe wall conduction resistance
+    R_p = gt.pipes.conduction_thermal_resistance_circular_pipe(r_in, r_out, k_p)
+
+    # Fluid-wall convection (single U and double U in series use same per-circuit flow)
+    h_f_ser = gt.pipes.convective_heat_transfer_coefficient_circular_pipe(
+        m_flow, r_in, mu_f, rho_f, k_f, cp_f, epsilon
+    )
+    R_f_ser = 1.0 / (h_f_ser * 2.0 * np.pi * r_in)
+
+    # For double U in parallel, the flow splits equally into 2 circuits
+    h_f_par = gt.pipes.convective_heat_transfer_coefficient_circular_pipe(
+        m_flow / 2.0, r_in, mu_f, rho_f, k_f, cp_f, epsilon
+    )
+    R_f_par = 1.0 / (h_f_par * 2.0 * np.pi * r_in)
+
+    # Single U-tube
+    SingleUTube = gt.pipes.SingleUTube(
+        pos_single, r_in, r_out, borehole, k_s, k_g, R_f_ser + R_p
+    )
+    # Double U-tube (parallel)
+    DoubleUTube_par = gt.pipes.MultipleUTube(
+        pos_double, r_in, r_out, borehole, k_s, k_g, R_f_par + R_p,
+        nPipes=2, config='parallel'
+    )
+    # Double U-tube (series)
+    DoubleUTube_ser = gt.pipes.MultipleUTube(
+        pos_double, r_in, r_out, borehole, k_s, k_g, R_f_ser + R_p,
+        nPipes=2, config='series'
+    )
+
+    # ---------------------------------------------------------------
+    # Simulation loop
+    # ---------------------------------------------------------------
+    T_b              = np.zeros(Nt)    # borehole wall temperature
+    T_f_in_single    = np.zeros(Nt)
+    T_f_in_double_par= np.zeros(Nt)
+    T_f_in_double_ser= np.zeros(Nt)
+    T_f_out_single   = np.zeros(Nt)
+    T_f_out_double_par = np.zeros(Nt)
+    T_f_out_double_ser = np.zeros(Nt)
+
+    for i, (t, Q_i) in enumerate(zip(time, Q)):
+        # advance time and set current linear load (W/m)
+        LoadAgg.next_time_step(t)
+        LoadAgg.set_current_load(Q_i / H)
+
+        # wall temperature (extraction → wall below Tg)
+        dT_b = LoadAgg.temporal_superposition()
+        T_b[i] = T_g - dT_b
+
+        # inlet temperatures (given total m_flow)
+        T_f_in_single[i] = SingleUTube.get_inlet_temperature(
+            Q[i], T_b[i], m_flow, cp_f
+        )
+        T_f_in_double_par[i] = DoubleUTube_par.get_inlet_temperature(
+            Q[i], T_b[i], m_flow, cp_f
+        )
+        T_f_in_double_ser[i] = DoubleUTube_ser.get_inlet_temperature(
+            Q[i], T_b[i], m_flow, cp_f
+        )
+
+        # outlet temperatures
+        T_f_out_single[i] = SingleUTube.get_outlet_temperature(
+            T_f_in_single[i], T_b[i], m_flow, cp_f
+        )
+        T_f_out_double_par[i] = DoubleUTube_par.get_outlet_temperature(
+            T_f_in_double_par[i], T_b[i], m_flow, cp_f
+        )
+        T_f_out_double_ser[i] = DoubleUTube_ser.get_outlet_temperature(
+            T_f_in_double_ser[i], T_b[i], m_flow, cp_f
+        )
+
+    # ---------------------------------------------------------------
+    # Plots — loads and temperatures
+    # ---------------------------------------------------------------
+    hours = np.arange(1, Nt + 1) * dt / 3600.0
+    fig = gt.utilities._initialize_figure()
+
+    ax1 = fig.add_subplot(211)
+    ax1.set_xlabel(r'Time [hours]')
+    ax1.set_ylabel(r'Heat extraction rate [W]')
+    gt.utilities._format_axes(ax1)
+    ax1.plot(hours, Q)
+
+    ax2 = fig.add_subplot(212)
+    ax2.set_xlabel(r'Time [hours]')
+    ax2.set_ylabel(r'Temperature [°C]')
+    gt.utilities._format_axes(ax2)
+    ax2.plot(hours, T_b, 'k-', lw=1.5, label='Borehole wall')
+    ax2.plot(hours, T_f_out_single,  '--', label='Outlet, single U-tube')
+    ax2.plot(hours, T_f_out_double_par, '-.', label='Outlet, double U-tube (parallel)')
+    ax2.plot(hours, T_f_out_double_ser, ':',  label='Outlet, double U-tube (series)')
+    ax2.legend()
+    plt.tight_layout()
+
+    # ---------------------------------------------------------------
+    # Depth profiles at ~1 year
+    # ---------------------------------------------------------------
+    nz = 20
+    it = min(8724, Nt - 1)
+    z = np.linspace(0.0, H, num=nz)
+
+    T_f_single     = SingleUTube.get_temperature(z, T_f_in_single[it], T_b[it], m_flow,       cp_f)
+    T_f_double_par = DoubleUTube_par.get_temperature(z, T_f_in_double_par[it], T_b[it], m_flow, cp_f)
+    T_f_double_ser = DoubleUTube_ser.get_temperature(z, T_f_in_double_ser[it], T_b[it], m_flow, cp_f)
+
+    fig = gt.utilities._initialize_figure()
+    ax3 = fig.add_subplot(131)
+    ax3.set_xlabel(r'Temperature [°C]')
+    ax3.set_ylabel(r'Depth from borehole head [m]')
+    gt.utilities._format_axes(ax3)
+    ax3.plot([T_b[it], T_b[it]], [0.0, H], 'k--')
+    ax3.plot(T_f_single, z, 'b-')
+    ax3.legend(['Borehole wall', 'Fluid'])
+
+    ax4 = fig.add_subplot(132)
+    ax4.set_xlabel(r'Temperature [°C]')
+    ax4.set_ylabel(r'Depth from borehole head [m]')
+    gt.utilities._format_axes(ax4)
+    ax4.plot([T_b[it], T_b[it]], [0.0, H], 'k--')
+    ax4.plot(T_f_double_par, z, 'b-')
+
+    ax5 = fig.add_subplot(133)
+    ax5.set_xlabel(r'Temperature [°C]')
+    ax5.set_ylabel(r'Depth from borehole head [m]')
+    gt.utilities._format_axes(ax5)
+    ax5.plot([T_b[it], T_b[it]], [0.0, H], 'k--')
+    ax5.plot(T_f_double_ser, z, 'b-')
+
+    # Reverse y-axes to show depth downward
+    ax3.set_ylim(ax3.get_ylim()[::-1])
+    ax4.set_ylim(ax4.get_ylim()[::-1])
+    ax5.set_ylim(ax5.get_ylim()[::-1])
+    plt.tight_layout()
+
+
+def synthetic_load(x_hours):
+    """
+    Synthetic load profile of Bernier et al. (2004).
+    Returns load y (in watts) at time x (in hours).
+    """
+    A = 2000.0; B = 2190.0; C = 80.0; D = 2.0; E = 0.01; F = 0.0; G = 0.95
+    func = (168.0 - C) / 168.0
+    for i in [1, 2, 3]:
+        func += (1.0 / (i * np.pi)) * (np.cos(C * np.pi * i / 84.0) - 1.0) \
+              * (np.sin(np.pi * i / 84.0 * (x_hours - B)))
+    func = func * A * np.sin(np.pi / 12.0 * (x_hours - B)) \
+               * np.sin(np.pi / 4380.0 * (x_hours - B))
+    y = func + (-1.0)**np.floor(D/8760.0*(x_hours - B)) * np.abs(func) \
+    + E * (-1.0)**np.floor(D/8760.0*(x_hours - B)) \
+      / np.sign(np.cos(D*np.pi/4380.0*(x_hours - F)) + G)
+    return -y
+
+
+if __name__ == "__main__":
+    main()

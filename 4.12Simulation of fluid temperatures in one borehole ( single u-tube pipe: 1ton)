@@ -1,9 +1,9 @@
 
 # -*- coding: utf-8 -*-
 """
-4.12***************** pygfunction >= 2.3.x
-Simulation of fluid temperatures in a single borehole
-Case: Single U-tube only : 1 ton 
+pygfunction >= 2.3.x
+4.12 — Simulation of fluid temperatures in a single borehole
+Case: Single U-tube only
 """
 
 import numpy as np
@@ -15,32 +15,33 @@ def main():
     # ---------------------------------------------------------------
     # Simulation parameters
     # ---------------------------------------------------------------
+
     # Borehole dimensions
     D   = 4.0       # burial depth [m]
-    H   = 88    # length [m]
-    r_b = 0.1524/2    # borehole radius [m]
+    H   = 150.0     # length [m]
+    r_b = 0.075     # borehole radius [m]
 
     # Pipe dimensions
-    r_out   = 0.032/2    # outer radius [m]
-    r_in    = 0.027/2    # inner radius [m]
-    D_s     = 0.05     # shank spacing [m]
+    r_out   = 0.0211    # outer radius [m]
+    r_in    = 0.0147    # inner radius [m]
+    D_s     = 0.052     # shank spacing [m]
     epsilon = 1.0e-6    # roughness [m]
 
-    # Pipe positions (single U-tube: [(x_in, y_in), (x_out, y_out)])
+    # Pipe positions (x,y) — Single U-tube: [(x_in, y_in), (x_out, y_out)]
     pos_single = [(-D_s, 0.0), ( D_s, 0.0)]
 
     # Ground
     alpha = 1.0e-6    # thermal diffusivity [m2/s]
-    k_s   = 2.45       # thermal conductivity [W/m.K]
-    T_g   = 25.5      # undisturbed ground temperature [°C]
+    k_s   = 2.0       # thermal conductivity [W/m.K]
+    T_g   = 10.0      # undisturbed ground temperature [°C]
 
     # Grout / pipe conductivity
-    k_g = 2.98         # grout [W/m.K]
-    k_p = 0.7         # pipe  [W/m.K]
+    k_g = 1.0         # grout [W/m.K]
+    k_p = 0.4         # pipe  [W/m.K]
 
     # Fluid (20% MPG at 20°C)
-    m_flow = 15/60                         # total mass flow rate [kg/s]
-    fluid  = gt.media.Fluid('WATER', 20.0)
+    m_flow = 0.25                         # mass flow rate [kg/s]
+    fluid  = gt.media.Fluid('MPG', 20.0)
     cp_f   = fluid.cp
     rho_f  = fluid.rho
     mu_f   = fluid.mu
@@ -77,9 +78,12 @@ def main():
     LoadAgg.initialize(gFunc.gFunc / (2.0 * np.pi * k_s))
 
     # ---------------------------------------------------------------
-    # Pipe model: Single U-tube
+    # Pipe model (Single U-tube)
     # ---------------------------------------------------------------
+    # Pipe wall conduction resistance
     R_p = gt.pipes.conduction_thermal_resistance_circular_pipe(r_in, r_out, k_p)
+
+    # Fluid-wall convection
     h_f = gt.pipes.convective_heat_transfer_coefficient_circular_pipe(
         m_flow, r_in, mu_f, rho_f, k_f, cp_f, epsilon
     )
@@ -92,16 +96,16 @@ def main():
     # ---------------------------------------------------------------
     # Simulation loop
     # ---------------------------------------------------------------
-    T_b            = np.zeros(Nt)    # borehole wall temperature
-    T_f_in_single  = np.zeros(Nt)
-    T_f_out_single = np.zeros(Nt)
+    T_b             = np.zeros(Nt)    # borehole wall temperature
+    T_f_in_single   = np.zeros(Nt)
+    T_f_out_single  = np.zeros(Nt)
 
     for i, (t, Q_i) in enumerate(zip(time, Q)):
         # advance time and set current linear load (W/m)
         LoadAgg.next_time_step(t)
         LoadAgg.set_current_load(Q_i / H)
 
-        # wall temperature
+        # wall temperature (extraction → wall below Tg)
         dT_b = LoadAgg.temporal_superposition()
         T_b[i] = T_g - dT_b
 
@@ -114,7 +118,7 @@ def main():
         )
 
     # ---------------------------------------------------------------
-    # Plot results
+    # Plots — loads and temperatures
     # ---------------------------------------------------------------
     hours = np.arange(1, Nt + 1) * dt / 3600.0
     fig = gt.utilities._initialize_figure()
@@ -124,12 +128,13 @@ def main():
     ax1.set_ylabel(r'Heat extraction rate [W]')
     gt.utilities._format_axes(ax1)
     ax1.plot(hours, Q)
+
     ax2 = fig.add_subplot(212)
     ax2.set_xlabel(r'Time [hours]')
     ax2.set_ylabel(r'Temperature [°C]')
     gt.utilities._format_axes(ax2)
     ax2.plot(hours, T_b, 'k-', lw=1.5, label='Borehole wall')
-    ax2.plot(hours, T_f_out_single, '--', label='Outlet, single U-tube')
+    ax2.plot(hours, T_f_out_single,  '--', label='Outlet, single U-tube')
     ax2.legend()
     plt.tight_layout()
 
@@ -139,7 +144,6 @@ def main():
     nz = 20
     it = min(8724, Nt - 1)
     z = np.linspace(0.0, H, num=nz)
-
     T_f_single = SingleUTube.get_temperature(z, T_f_in_single[it], T_b[it], m_flow, cp_f)
 
     fig = gt.utilities._initialize_figure()
@@ -147,9 +151,9 @@ def main():
     ax3.set_xlabel(r'Temperature [°C]')
     ax3.set_ylabel(r'Depth from borehole head [m]')
     gt.utilities._format_axes(ax3)
-    ax3.plot([T_b[it], T_b[it]], [0.0, H], 'k--')
+    ax3.plot([T_b[it], T_b[it]], [0.0, H], 'k--', label='Borehole wall')
     ax3.plot(T_f_single, z, 'b-', label='Fluid')
-    ax3.legend(['Borehole wall', 'Fluid'])
+    ax3.legend()
     ax3.set_ylim(ax3.get_ylim()[::-1])  # depth downward
     plt.tight_layout()
 
@@ -159,25 +163,19 @@ def synthetic_load(x_hours):
     Synthetic load profile of Bernier et al. (2004).
     Returns load y (in watts) at time x (in hours).
     """
-    A = 1*3.157*1000    # W  (≈ 2.5 ton × 3.517 kW/ton)
-    B = 1185.0    # h  (aligns seasonal peak ~late May; daily peak at ~15:00)
-    C = 56.0      # h/week (8 h × 7 days)
-    D = 1.0       # 1 seasonal half-cycle (cooling-only envelope)
-    E = 0.01       # disable extra seasonal flip/bias
-    F = 0.0
-    G = 0.95      # keeps sign logic stable
-
+    A = 2000.0; B = 2190.0; C = 80.0; D = 2.0; E = 0.01; F = 0.0; G = 0.95
     func = (168.0 - C) / 168.0
     for i in [1, 2, 3]:
         func += (1.0 / (i * np.pi)) * (np.cos(C * np.pi * i / 84.0) - 1.0) \
               * (np.sin(np.pi * i / 84.0 * (x_hours - B)))
     func = func * A * np.sin(np.pi / 12.0 * (x_hours - B)) \
                * np.sin(np.pi / 4380.0 * (x_hours - B))
-    y = func + (-1.0) * np.pi * np.floor(D / 8760.0 * (x_hours - B)) * np.abs(func) \
-      + E * (-1.0) * np.pi * np.floor(D / 8760.0 * (x_hours - B)) \
-      / np.sign(np.cos(D * np.pi / 4380.0 * (x_hours - F)) + G)
+    y = func + (-1.0)**np.floor(D/8760.0*(x_hours - B)) * np.abs(func) \
+        + E * (-1.0)**np.floor(D/8760.0*(x_hours - B)) \
+          / np.sign(np.cos(D*np.pi/4380.0*(x_hours - F)) + G)
     return -y
 
 
 if __name__ == "__main__":
-    main()    
+    main()
+
